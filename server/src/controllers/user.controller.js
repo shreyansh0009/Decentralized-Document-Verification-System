@@ -1,0 +1,454 @@
+import { asyncHandler } from "../utils/asyncHandler.js";
+import { apiError } from "../utils/apiError.js";
+import { apiResponse } from "../utils/apiResponse.js";
+import { User } from "../models/user.model.js";
+import { Document } from "../models/document.model.js";
+import { adminContract } from "../utils/ethersService.js";
+import jwt from "jsonwebtoken";
+import { ethers } from "ethers";
+import { sendStudentRegisteredEmail } from "../utils/emailService.js";
+
+// Module-level function to generate access and refresh tokens
+const generateAccessAndRefreshToken = async (userId) => {
+  const loggedInUser = await User.findById(userId);
+  if (!loggedInUser) {
+    throw new apiError(404, "User not found");
+  }
+  const accessToken = await loggedInUser.generateAccessToken();
+  const refreshToken = await loggedInUser.generateRefreshToken();
+
+  loggedInUser.refreshToken = refreshToken;
+  await loggedInUser.save({ validateBeforeSave: false });
+  return { accessToken, refreshToken };
+};
+
+// Helper function for user registration logic
+const createUserAccount = async ({ userName, email, fullName, password, userType, department, ethereumAddress, registeredBy, phone }) => {
+  // Validate core fields
+  const coreFields = [userName, email, fullName, password];
+  if (coreFields.some((field) => !field || field.trim() === "")) {
+    throw new apiError(400, "Username, email, fullName, and password are required");
+  }
+
+  // Conditionally validate 'department'
+  if (
+    (userType === "STUDENT" || userType === "ISSUER") &&
+    (!department || department.trim() === "")
+  ) {
+    throw new apiError(400, "Department is required for Students and Issuers");
+  }
+
+  // If the user is an ISSUER, their Ethereum wallet address is mandatory
+  if (
+    userType === "ISSUER" &&
+    (!ethereumAddress || !ethers.isAddress(ethereumAddress))
+  ) {
+    throw new apiError(400, "A valid Ethereum address is required for an Issuer");
+  }
+
+  // Normalize inputs *before* querying
+  const normalizedUsername = userName.toLowerCase();
+  const normalizedEmail = email.toLowerCase();
+
+  //iii. checking user exists or not?
+  const isExists = await User.findOne({
+    $or: [{ username: normalizedUsername }, { email: normalizedEmail }],
+  });
+  if (isExists) {
+    throw new apiError(409, "User already exists!");
+  }
+
+  //v. now creating user in database.
+  const userToCreate = {
+    fullName,
+    email: normalizedEmail,
+    password,
+    username: normalizedUsername,
+    userType,
+    ethereumAddress: userType === "ISSUER" ? ethereumAddress : undefined,
+    phone: phone || undefined,
+  };
+
+  // Only add department if it's provided and relevant
+  if (userType !== "ADMIN" && department) {
+    userToCreate.department = department;
+  }
+
+  // Track who registered this student
+  if (registeredBy) {
+    userToCreate.registeredBy = registeredBy;
+  }
+
+  // Create the DB user first, then grant blockchain role.
+  // This way if DB creation fails, we never touch the blockchain.
+  const user = await User.create(userToCreate);
+
+  // 7. --- BLOCKCHAIN LOGIC (after DB creation) ---
+  if (userType === "ISSUER") {
+    try {
+      console.log(`Granting ISSUER role to ${ethereumAddress} on-chain...`);
+      const tx = await adminContract.setIssuer(ethereumAddress, true);
+      await tx.wait();
+      console.log(`Role granted. Transaction hash: ${tx.hash}`);
+    } catch (onChainError) {
+      // Blockchain failed — roll back the DB user to keep data consistent
+      await User.findByIdAndDelete(user._id);
+      console.error("On-chain error while adding issuer:", onChainError.message);
+      throw new apiError(
+        500,
+        "Failed to grant on-chain role. Database user not created."
+      );
+    }
+  }
+
+  //iv. validating user created or not?
+  const createdUser = await User.findById(user._id)
+    .populate("department")
+    .select("-password -refreshToken");
+
+  if (!createdUser) {
+    throw new apiError(500, "Something went wrong while registering the user");
+  }
+
+  return createdUser;
+};
+
+// Admin-only: Register Issuer
+const registerIssuer = asyncHandler(async (req, res) => {
+  const { userName, email, fullName, password, department, ethereumAddress } = req.body;
+  
+  const createdUser = await createUserAccount({
+    userName,
+    email,
+    fullName,
+    password,
+    userType: "ISSUER",
+    department,
+    ethereumAddress,
+  });
+
+  res.status(201).json({
+    success: true,
+    message: "Issuer registered successfully",
+    data: createdUser,
+  });
+});
+
+// Issuer-only: Register Student
+const registerStudent = asyncHandler(async (req, res) => {
+  const { userName, email, fullName, password, department, phone } = req.body;
+
+  const createdUser = await createUserAccount({
+    userName,
+    email,
+    fullName,
+    password,
+    userType: "STUDENT",
+    department,
+    ethereumAddress: undefined,
+    registeredBy: req.user._id,
+    phone,
+  });
+
+  // Send welcome email with credentials (non-fatal if it fails)
+  try {
+    await sendStudentRegisteredEmail({
+      toEmail: email,
+      studentName: fullName,
+      username: userName.toLowerCase(),
+      password,
+      departmentName: createdUser.department?.name || "N/A",
+      registeredByName: req.user.fullName,
+    });
+  } catch (emailError) {
+    console.error("Welcome email failed (non-fatal):", emailError.message);
+  }
+
+  res.status(201).json({
+    success: true,
+    message: "Student registered successfully",
+    data: createdUser,
+  });
+});
+
+// User validation or login
+const loginUser = asyncHandler(async (req, res) => {
+  //1. getting data from body
+  const { username, password } = req.body;
+
+  //2. checking for empty fields...
+  if (!username || !password || username.trim() === "" || password.trim() === "") {
+    throw new apiError(400, "Username and password are required!");
+  }
+
+  //3. finding user in database..
+  const user = await User.findOne({ username: username.toLowerCase() });
+  if (!user) {
+    throw new apiError(404, "User doesn't exists");
+  }
+
+  const isPasswordValid = await user.isPasswordCorrect(password);
+  if (!isPasswordValid) {
+    throw new apiError(401, "Invalid user credentials!");
+  }
+
+  // we gonna use it many times, that why make a function
+  //calling function..
+  const { accessToken, refreshToken } = await generateAccessAndRefreshToken(
+    user._id
+  );
+
+  // updating 'user' object after generating access and refresh token
+  const loggedInUser = await User.findById(user._id).select(
+    "-password -refreshToken"
+  );
+
+  //options for cookies
+  const options = {
+    // httpOnly: used for, client won't able to edit cookies in his browser, cookies can only editable from server
+    httpOnly: true,
+    secure: true,
+  };
+
+  return res
+    .status(200)
+    .cookie("accessToken", accessToken, options)
+    .cookie("refreshToken", refreshToken, options)
+    .json(
+      new apiResponse(
+        200,
+        {
+          user: loggedInUser,
+          accessToken,
+          refreshToken,
+        },
+        "User logged In successfully!"
+      )
+    );
+});
+
+// loging out user using middleware..
+const logoutUser = asyncHandler(async (req, res) => {
+  await User.findByIdAndUpdate(
+    req.user._id,
+    {
+      $unset: { refreshToken: "" },
+    },
+    {
+      new: true,
+    }
+  );
+  const options = {
+    // httpOnly: used for, client won't able to edit cookies in his browser, cookies can only editable from server
+    httpOnly: true,
+    secure: true,
+  };
+  return res
+    .status(200)
+    .clearCookie("accessToken", options)
+    .clearCookie("refreshToken", options)
+    .json(new apiResponse(200, {}, "User logged out successfully!"));
+});
+
+// Refreshing access token
+
+const refreshAccessToken = asyncHandler(async (req, res) => {
+  const incomingRefreshToken =
+    req.cookies.refreshToken || req.body.refreshToken;
+
+  if (!incomingRefreshToken) {
+    throw new apiError(401, "unauthorized request!!");
+  }
+
+  try {
+    const decodedIncomingRefreshToken = jwt.verify(
+      incomingRefreshToken,
+      process.env.SECRET_REFRESH_TOKEN
+    );
+    if (!decodedIncomingRefreshToken) {
+      throw new apiError(401, "Invalid Refresh Token!");
+    }
+
+    const user = await User.findById(decodedIncomingRefreshToken?._id);
+
+    if (!user) {
+      throw new apiError(401, "Invalid user!");
+    }
+
+    // Compare the raw token string, not the decoded object
+    if (incomingRefreshToken !== user.refreshToken) {
+      throw new apiError(401, "Token is invalid or may modified!");
+    }
+
+    const options = {
+      httpOnly: true,
+      secure: true,
+    };
+
+    const { accessToken, refreshToken: newRefreshToken } =
+      await generateAccessAndRefreshToken(user._id);
+
+    return res
+      .status(200)
+      .cookie("accessToken", accessToken, options)
+      .cookie("refreshToken", newRefreshToken, options)
+      .json(
+        new apiResponse(
+          200,
+          { accessToken, refreshToken: newRefreshToken },
+          "Access Token Refreshed!"
+        )
+      );
+  } catch (error) {
+    throw new apiError(401, error?.message || "Something went wrong!");
+  }
+});
+
+// Re-grant issuer role on blockchain (useful after contract redeployment)
+const regrantIssuerRole = asyncHandler(async (req, res) => {
+  const { ethereumAddress } = req.body;
+
+  if (!ethereumAddress) {
+    throw new apiError(400, "Ethereum address is required");
+  }
+
+  // Find the user by ethereum address
+  const user = await User.findOne({ ethereumAddress: ethereumAddress.toLowerCase() });
+  
+  if (!user) {
+    throw new apiError(404, "User with this Ethereum address not found");
+  }
+
+  if (user.userType !== "ISSUER") {
+    throw new apiError(400, "User is not an issuer");
+  }
+
+  try {
+    console.log(`Re-granting ISSUER role to ${ethereumAddress} on-chain...`);
+    const tx = await adminContract.setIssuer(ethereumAddress, true);
+    await tx.wait();
+    console.log(`Role re-granted. Transaction hash: ${tx.hash}`);
+
+    return res.status(200).json(
+      new apiResponse(
+        200, 
+        { 
+          transactionHash: tx.hash,
+          user: {
+            fullName: user.fullName,
+            email: user.email,
+            ethereumAddress: user.ethereumAddress
+          }
+        }, 
+        "Issuer role re-granted on blockchain successfully"
+      )
+    );
+  } catch (onChainError) {
+    console.error("On-chain error while re-granting issuer role:", onChainError.message);
+    throw new apiError(500, "Failed to grant on-chain role: " + onChainError.message);
+  }
+});
+
+// Get all users (Admin only)
+const getAllUsers = asyncHandler(async (req, res) => {
+    const users = await User.find()
+      .select('-password -refreshToken')
+      .populate('department', 'name shortCode')
+      .sort({ createdAt: -1 });
+    
+    return res.status(200).json(
+      new apiResponse(200, users, "Users fetched successfully")
+    );
+});
+
+// Get students registered by the logged-in issuer
+const getMyStudents = asyncHandler(async (req, res) => {
+    const students = await User.find({ 
+      registeredBy: req.user._id,
+      userType: 'STUDENT'
+    })
+      .select('-password -refreshToken')
+      .populate('department', 'name shortCode')
+      .sort({ createdAt: -1 });
+    
+    // Fetch documents for each student
+    const studentsWithDocs = await Promise.all(
+      students.map(async (student) => {
+        const documents = await Document.find({ owner: student._id })
+          .select('status documentName createdAt')
+          .sort({ createdAt: -1 });
+        
+        return {
+          ...student.toObject(),
+          documents
+        };
+      })
+    );
+    
+    return res.status(200).json(
+      new apiResponse(200, studentsWithDocs, "Students fetched successfully")
+    );
+});
+
+// Get all students in issuer's department with their documents
+const getDepartmentStudents = asyncHandler(async (req, res) => {
+    // Find all students in the issuer's department
+    const students = await User.find({ 
+      department: req.user.department,
+      userType: 'STUDENT'
+    })
+      .select('-password -refreshToken')
+      .populate('department', 'name shortCode')
+      .sort({ createdAt: -1 });
+    
+    // Fetch documents for each student with detailed info
+    const studentsWithDocs = await Promise.all(
+      students.map(async (student) => {
+        const documents = await Document.find({ owner: student._id })
+          .select('documentName status createdAt issuedAt issuer')
+          .populate('issuer', 'fullName username')
+          .sort({ createdAt: -1 });
+        
+        return {
+          ...student.toObject(),
+          documents,
+          totalDocuments: documents.length,
+          pendingDocuments: documents.filter(d => d.status === 'PENDING').length,
+          issuedDocuments: documents.filter(d => d.status === 'ISSUED').length,
+          rejectedDocuments: documents.filter(d => d.status === 'REJECTED').length
+        };
+      })
+    );
+    
+    return res.status(200).json(
+      new apiResponse(200, studentsWithDocs, "Department students fetched successfully")
+    );
+});
+
+// Get current user with populated department
+const getCurrentUser = asyncHandler(async (req, res) => {
+    const user = await User.findById(req.user._id)
+      .select('-password -refreshToken')
+      .populate('department', 'name shortCode');
+    
+    if (!user) {
+      throw new apiError(404, "User not found");
+    }
+    
+    return res.status(200).json(
+      new apiResponse(200, user, "User fetched successfully")
+    );
+});
+
+export { 
+  registerIssuer, 
+  registerStudent, 
+  loginUser, 
+  logoutUser, 
+  refreshAccessToken, 
+  regrantIssuerRole,
+  getAllUsers,
+  getMyStudents,
+  getDepartmentStudents,
+  getCurrentUser
+};

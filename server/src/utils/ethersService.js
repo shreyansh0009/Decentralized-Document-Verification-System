@@ -1,0 +1,54 @@
+import { ethers } from "ethers";
+import fs from "fs";
+import path from "path";
+import { fileURLToPath } from 'url';
+import dotenv from "dotenv";
+
+
+// --- CONFIGURATION ---
+
+// 1. Get the path to the contract-info.json file
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
+
+dotenv.config({ path: path.resolve(__dirname, "../../.env")});
+// Navigate two levels up from utils (src/utils -> src -> server) to the root
+const contractInfoPath = path.resolve(__dirname, "..", "..", "contract-info.json");
+
+if (!fs.existsSync(contractInfoPath)) {
+    throw new Error("contract-info.json not found. Please deploy the contract first (run `npx hardhat run scripts/deploy.js --network polygonAmoy` in the /blockchain folder).");
+}
+
+const contractInfo = JSON.parse(fs.readFileSync(contractInfoPath));
+const CONTRACT_ADDRESS = contractInfo.address;
+const CONTRACT_ABI = contractInfo.abi;
+
+const RPC_URL = process.env.POLYGON_AMOY_RPC_URL || "http://127.0.0.1:8545";
+const ADMIN_PRIVATE_KEY = process.env.CONTRACT_ADMIN_PRIVATE_KEY;
+
+if (!ADMIN_PRIVATE_KEY || !CONTRACT_ADDRESS || !CONTRACT_ABI) {
+    throw new Error("Missing required environment variables (ADMIN_PRIVATE_KEY) or contract info.");
+}
+
+console.log(`Ethers service connecting to RPC: ${RPC_URL}`);
+
+// 2. Initialize the Provider and Signer (Admin Wallet)
+const provider = new ethers.JsonRpcProvider(RPC_URL);
+const adminWallet = new ethers.Wallet(ADMIN_PRIVATE_KEY, provider);
+
+// 3. Initialize the Contract Instance (with Admin read/write access)
+const adminContract = new ethers.Contract(CONTRACT_ADDRESS, CONTRACT_ABI, adminWallet);
+
+// 4. Read-only contract instance (for public verification)
+const publicContract = new ethers.Contract(CONTRACT_ADDRESS, CONTRACT_ABI, provider);
+
+console.log("Ethers service initialized. Connected to contract at:", CONTRACT_ADDRESS);
+
+// 5. Helper function to get a contract instance for a specific issuer
+function getIssuerContract(issuerPrivateKey) {
+    const issuerWallet = new ethers.Wallet(issuerPrivateKey, provider);
+    return new ethers.Contract(CONTRACT_ADDRESS, CONTRACT_ABI, issuerWallet);
+}
+
+// 6. Export the contract instances, provider, and helper
+export { adminContract, publicContract, provider, getIssuerContract, CONTRACT_ADDRESS, CONTRACT_ABI };
